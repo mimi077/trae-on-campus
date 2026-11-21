@@ -1,0 +1,432 @@
+// 校园闲置二手平台 V4 —— Prisma 数据模型
+// 说明：SQLite provider 不支持 Prisma enum 与标量数组，因此：
+// - status / role / bargainMode / bidStatus / reportStatus 使用 String + 后端白名单校验
+// - sceneTags 使用 JSON 字符串存储，读写时由服务端序列化
+// 全部「每人限一次」业务均以数据库联合唯一索引兜底。
+
+generator client {
+  provider      = "prisma-client-js"
+  // 运行时需要同时覆盖构建机与 ByteFaaS 运行时的 OpenSSL 版本
+  binaryTargets = ["native", "debian-openssl-1.1.x", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id
+  name         String
+  campus       String
+  role         String   @default("USER")
+  studentNo    String?  @unique
+  passwordHash String?
+  /// V8 新增：接收截止提醒 / 审核通知的邮箱
+  email        String?
+  college      String?
+  major        String?
+  grade        String?
+  bio          String?
+  avatarColor  String?
+  /// V7.1：学生完整身份认证（学院-专业-年级-班级）
+  className    String?
+  /// UNAUTH 未认证 / AUTHED 已认证；教师与管理员默认 AUTHED
+  authStatus   String   @default("UNAUTH")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+/// 登录会话：httpOnly Cookie 里只放随机 token，服务端据此查库校验有效期
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Item {
+  id          String     @id @default(cuid())
+  title       String
+  category    String
+  sceneTags   String     @default("[]")
+  dealTags    String     @default("[]")
+  isGift      Boolean    @default(false)
+  bargainMode String     @default("FREE_BARGAIN")
+  isbn        String?
+  price       Float
+  description String?
+  imageUrl    String?
+  status      String     @default("ON_SALE")
+  expiresAt   DateTime?
+  userId      String
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  favorites        Favorite[]
+  intentFavorites  IntentFavorite[]
+}
+
+model Favorite {
+  id        String   @id @default(cuid())
+  userId    String
+  itemId    String
+  item      Item     @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  // 每人一票边界防护：同一用户对同一个商品仅允许一条普通收藏
+  @@unique([userId, itemId])
+}
+
+model IntentFavorite {
+  id        String   @id @default(cuid())
+  userId    String
+  itemId    String
+  item      Item     @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  // 意向收藏同样每人一票，卖家只能看到统计数量
+  @@unique([userId, itemId])
+}
+
+model WishPurchase {
+  id          String   @id @default(cuid())
+  userId      String
+  title       String
+  category    String
+  expectPrice Float
+  description String?
+  expireAt    DateTime
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+}
+
+model Bid {
+  id        String   @id @default(cuid())
+  itemId    String
+  userId    String
+  price     Float
+  status    String   @default("PENDING")
+  createdAt DateTime @default(now())
+
+  // 同一用户对同一商品只能提交一次出价
+  @@unique([userId, itemId])
+}
+
+model GiftApproval {
+  id         String   @id @default(cuid())
+  giftItemId String
+  userId     String
+  createdAt  DateTime @default(now())
+
+  @@unique([userId, giftItemId])
+}
+
+model Message {
+  id            String   @id @default(cuid())
+  fromUserId    String
+  toUserId      String
+  content       String
+  relatedItemId String?
+  relatedWishId String?
+  createdAt     DateTime @default(now())
+}
+
+model Report {
+  id             String   @id @default(cuid())
+  reporterUserId String
+  targetItemId   String?
+  targetWishId   String?
+  reason         String
+  status         String   @default("PENDING")
+  createdAt      DateTime @default(now())
+}
+
+model AdminLog {
+  id          String   @id @default(cuid())
+  adminUserId String
+  action      String
+  targetId    String
+  createdAt   DateTime @default(now())
+}
+
+/// 失物招领：LOST=寻物启事（丢了东西） / FOUND=失物招领（捡到东西）
+/// 发布后先进入 PENDING，管理员审核通过（APPROVED）才会出现在公开列表
+model LostFound {
+  id          String   @id @default(cuid())
+  kind        String   @default("LOST")
+  title       String
+  category    String
+  location    String
+  happenedAt  DateTime
+  description String?
+  imageUrl    String?
+  contact     String?
+  status      String   @default("PENDING")
+  reviewNote  String?
+  reviewedBy  String?
+  reviewedAt  DateTime?
+  userId      String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  messages    LostFoundMessage[]
+
+  @@index([status])
+  @@index([kind])
+}
+
+/// 失物招领留言：公开可见，用于失主与拾获者互相联系
+model LostFoundMessage {
+  id        String    @id @default(cuid())
+  recordId  String
+  record    LostFound @relation(fields: [recordId], references: [id], onDelete: Cascade)
+  userId    String
+  content   String
+  createdAt DateTime  @default(now())
+
+  @@index([recordId])
+}
+
+/// 校园活动：教师发布官方活动直接 PUBLIC，学生/社团提交先进入 PENDING
+/// 状态 PUBLISHED → ONGOING → ENDED 由服务端按时间惰性流转
+model Activity {
+  id                   String         @id @default(cuid())
+  title                String
+  type                 String
+  source               String
+  organizer            String
+  startAt              DateTime
+  endAt                DateTime
+  registrationDeadline DateTime
+  location             String
+  capacity             Int
+  /// V8 新增：名额无限（true 时 capacity 仅作展示占位，不参与满员判断）
+  isUnlimited          Boolean        @default(false)
+  /// V8 新增：作品提交截止时间；为空时回落到 endAt
+  submissionDeadline   DateTime?
+  /// V8 新增：是否已开启作品展示专区
+  showcaseEnabled      Boolean        @default(false)
+  registrationMode     String         @default("INTERNAL")
+  externalUrl          String?
+  summary              String?
+  description          String?
+  coverUrl             String?
+  tags                 String         @default("[]")
+  /// V7.1 新增：可获得学分（选填）
+  creditPoints         Float?
+  /// V7.1 新增：发布人联系方式展示文本
+  publisherContact     String?
+  /// V7.1 新增：活动 QQ 群号（仅展示 + 复制）
+  qqGroup              String?
+  /// V7.1 新增：受众标签（JSON 数组），全空表示面向全部学生
+  targetCollege        String         @default("[]")
+  targetGrade          String         @default("[]")
+  targetMajor          String         @default("[]")
+  targetClass          String         @default("[]")
+  status               String         @default("PENDING")
+  reviewNote           String?
+  reviewedBy           String?
+  reviewedAt           DateTime?
+  createdBy            String
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
+  registrations        Registration[]
+  messages             ActivityMessage[]
+  workCategories       WorkCategory[]
+  works                ShowcaseWork[]
+
+  @@index([status, startAt])
+  @@index([source])
+  @@index([createdBy])
+}
+
+/// 活动报名：同一用户同一活动唯一；已占用名额 = PENDING + APPROVED
+model Registration {
+  id         String   @id @default(cuid())
+  activityId String
+  activity   Activity @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  userId     String
+  status     String   @default("APPROVED")
+  note       String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([userId, activityId])
+  @@index([activityId, status])
+  @@index([userId])
+}
+
+/// 活动留言答疑：公开可见
+model ActivityMessage {
+  id         String   @id @default(cuid())
+  activityId String
+  activity   Activity @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  userId     String
+  content    String
+  createdAt  DateTime @default(now())
+
+  @@index([activityId])
+}
+
+/// 首页热门活动池（管理员维护，不修改 Activity 原表）
+model HotActivity {
+  id          String   @id @default(cuid())
+  sortOrder   Int      @default(0)
+  isExternal  Boolean  @default(false)
+  externalUrl String?
+  activityId  String?
+  title       String
+  coverUrl    String?
+  createdAt   DateTime @default(now())
+
+  @@index([sortOrder])
+}
+
+/// 行政通知：筛选条件全部为空 = 全员通知
+/// publishAt 之前的通知不进入消息栏，用于教师预约定时发布
+model AdminNotice {
+  id            String   @id @default(cuid())
+  title         String
+  content       String
+  dept          String
+  targetCollege String?
+  targetGrade   String?
+  targetMajor   String?
+  targetClass   String?
+  createdBy     String
+  isActive      Boolean  @default(true)
+  /// V9 新增：计划发布时间，默认即时发布
+  publishAt     DateTime @default(now())
+  createdAt     DateTime @default(now())
+
+  @@index([isActive, createdAt])
+  @@index([isActive, publishAt])
+}
+
+/// 通知已读记录
+model UserNoticeRead {
+  id       String   @id @default(cuid())
+  userId   String
+  noticeId String
+  readAt   DateTime @default(now())
+
+  @@unique([userId, noticeId])
+  @@index([userId])
+}
+
+/// ============ V9：学生课表 ============
+
+/// 学生导入的课表条目：weekday 1-7，节次 1-12，周次 1-30
+/// 每次导入按用户整体覆盖，避免重复导入产生脏数据
+model TimetableCourse {
+  id           String   @id @default(cuid())
+  userId       String
+  name         String
+  teacher      String?
+  location     String?
+  weekday      Int
+  startSection Int
+  endSection   Int
+  startWeek    Int
+  endWeek      Int
+  /// ALL=每周 / ODD=单周 / EVEN=双周
+  weekType     String   @default("ALL")
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+}
+
+/// ============ V8：作品展示专区 ============
+
+/// 作品分类：由竞赛发布者 / 管理员为单个活动维护
+model WorkCategory {
+  id         String         @id @default(cuid())
+  activityId String
+  activity   Activity       @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  name       String
+  sortOrder  Int            @default(0)
+  createdAt  DateTime       @default(now())
+  works      ShowcaseWork[]
+
+  @@unique([activityId, name])
+  @@index([activityId, sortOrder])
+}
+
+/// 参赛作品：每个用户对同一活动只能提交一份（可反复修改）
+/// status: PENDING / APPROVED / REJECTED，只有 APPROVED 会公开展示
+model ShowcaseWork {
+  id          String        @id @default(cuid())
+  activityId  String
+  activity    Activity      @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  categoryId  String?
+  category    WorkCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  createdBy   String
+  authorName  String
+  title       String
+  /// 富文本描述：入库前统一经过白名单净化（见 src/lib/rules/richtext.ts）
+  description String?
+  workUrl     String?
+  coverUrl    String?
+  /// 多媒体资源 JSON：[{ type: IMAGE|VIDEO|FILE, url, name }]
+  media       String        @default("[]")
+  status      String        @default("PENDING")
+  reviewNote  String?
+  featured    Boolean       @default(false)
+  pinned      Boolean       @default(false)
+  sortOrder   Int           @default(0)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@unique([activityId, createdBy])
+  @@index([activityId, status, pinned, sortOrder])
+  @@index([categoryId])
+}
+
+/// ============ V8：站内系统消息 ============
+
+/// 站内通知：截止提醒 / 审核结果 / 提交回执 / 系统公告
+model UserNotification {
+  id        String    @id @default(cuid())
+  userId    String
+  type      String    @default("SYSTEM")
+  title     String
+  content   String
+  link      String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, createdAt])
+  @@index([userId, readAt])
+}
+
+/// ============ V8：邮件发件箱 ============
+
+/// 提醒邮件先落库再异步投递；未配置 SMTP 时标记 SIMULATED，便于审计与重试
+model EmailOutbox {
+  id        String    @id @default(cuid())
+  toEmail   String
+  subject   String
+  content   String
+  status    String    @default("PENDING")
+  error     String?
+  createdAt DateTime  @default(now())
+  sentAt    DateTime?
+
+  @@index([status, createdAt])
+}
+
+/// ============ V8：阶梯截止提醒幂等台账 ============
+
+/// 同一活动 + 同一用户 + 同一阶段只允许一条，天然防止重复推送
+model DeadlineReminder {
+  id         String   @id @default(cuid())
+  activityId String
+  userId     String
+  stage      String
+  createdAt  DateTime @default(now())
+
+  @@unique([activityId, userId, stage])
+  @@index([activityId])
+}
